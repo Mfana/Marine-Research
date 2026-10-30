@@ -1,0 +1,124 @@
+# Marine AI Research — central configuration.
+# Change study parameters here, not in code. Credentials never go in this file.
+
+project:
+  name: marine-ai-research
+  random_seed: 42
+  log_dir: logs
+  log_level: INFO
+
+dataset:
+  provider: Copernicus Marine Service
+  product_id: GLOBAL_MULTIYEAR_PHY_001_030
+  product_title: Global Ocean Physics Reanalysis
+  doi: "10.48670/moi-00021"
+  # Temporal resolution key -> dataset ID. Switch `active_resolution` to move to daily.
+  datasets:
+    monthly: cmems_mod_glo_phy_my_0.083deg_P1M-m
+    daily: cmems_mod_glo_phy_my_0.083deg_P1D-m
+    static: cmems_mod_glo_phy_my_0.083deg_static
+  active_resolution: monthly
+  dataset_version: "202311"     # pin for reproducibility; null = latest
+  service: arco-geo-series      # lazy Zarr access; arco-time-series suits long point series
+  licence: Copernicus Marine Service Licence (free, attribution required)
+  citation: >-
+    E.U. Copernicus Marine Service Information (CMEMS). Global Ocean Physics
+    Reanalysis. DOI: 10.48670/moi-00021
+  data_type: model reanalysis (NEMO + data assimilation) — not independent observations
+
+study_area:
+  name: Southern Africa (south/west coast and Agulhas region)
+  min_lon: 16.0
+  max_lon: 34.0
+  min_lat: -36.0
+  max_lat: -28.0
+  start: "1993-01-01"
+  end: "2025-12-31"
+
+# Sub-regions of the study area, split at Cape Agulhas (20°E), the conventional
+# Atlantic/Indian Ocean boundary. Ocean cells only (land is NaN).
+sub_regions:
+  benguela:
+    name: Benguela (west coast, Atlantic)
+    description: Southern Benguela upwelling system and adjacent South Atlantic
+    min_lon: 16.0
+    max_lon: 20.0
+    min_lat: -36.0
+    max_lat: -28.0
+  agulhas:
+    name: Agulhas (south and east coast, Indian)
+    description: Agulhas Bank shelf and Agulhas Current along the south and east coasts
+    min_lon: 20.0833
+    max_lon: 34.0
+    min_lat: -36.0
+    max_lat: -28.0
+
+# Shelf vs offshore split within each sub-region, from the static bathymetry (deptho).
+# 200 m is the conventional shelf-break isobath. The Agulhas Current core runs just
+# seaward of the shelf break, so it falls in agulhas_offshore.
+zones:
+  shelf_isobath_m: 200
+  nearshore_km: 50              # coastal band for the upwelling comparison
+
+# Independent observational reference for validating reanalysis trends.
+validation:
+  product_id: SST_GLO_SST_L4_REP_OBSERVATIONS_010_024
+  product_title: ESA SST CCI and C3S reprocessed sea surface temperature analyses
+  dataset_id: C3S-GLO-SST-L4-REP-OBS-SST
+  variable: analysed_sst        # kelvin; daily-mean SST at ~20 cm depth, 0.05° grid
+  service: arco-time-series     # time-long chunks: far less transfer than geo-series for a region
+  start: "1993-01-01"
+  end: "2024-12-31"             # last full year of the product
+
+# Which SST source each kind of analysis uses, chosen after validating the reanalysis against
+# the satellite record (notebook 08): coastal trend and upwelling work uses the satellite record. The reanalysis stays the source for offshore,
+# subsurface and dynamical variables.
+analysis:
+  coastal_source: satellite
+  offshore_source: reanalysis
+  zone_series:
+    satellite: data/processed/sst_satellite_zones_monthly.csv
+    reanalysis: data/processed/thetao_reanalysis_zones_1993_2024.csv
+  # Monthly-mean surface grids cached once by scripts/cache_monthly_grids.py (derived
+  # products, float32, compressed; no daily data). Sensitivity tests read these locally.
+  monthly_grids:
+    satellite: data/cache/sst_satellite_monthly_1993_2024.nc
+    reanalysis: data/cache/thetao_reanalysis_monthly_1993_2025.nc
+
+variables:
+  primary: [thetao]
+  future: [so, uo, vo, zos, mlotst]
+
+depth:
+  # Nearest-surface level of the model grid (0.494025 m).
+  min_depth: 0.494025
+  max_depth: 0.494025
+  method: nearest
+
+# Tiny connectivity test: one coastal ocean point, three months, one variable, one depth.
+connectivity_test:
+  name: Off Cape Town (Atlantic coast)
+  lon: 18.0
+  lat: -34.0
+  start: "1993-01-01"
+  end: "1993-03-31"
+
+# Small example: a coastal box for the first worked time series.
+sample_region:
+  name: False Bay / Cape Point box
+  min_lon: 18.25
+  max_lon: 18.75
+  min_lat: -34.50
+  max_lat: -34.00
+
+safeguards:
+  # Operations estimated above this size require explicit approval.
+  max_transfer_mb_without_approval: 50
+  max_memory_fraction: 0.5
+
+modelling:
+  # Chronological splits (inclusive end dates); no shuffling.
+  train_end: "2015-12-31"
+  validation_end: "2019-12-31"
+  test_end: "2025-12-31"
+  lags: [1, 2, 3, 12]
