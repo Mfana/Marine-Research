@@ -29,7 +29,8 @@ def to_anomalies(df: pd.DataFrame, clim: pd.DataFrame) -> pd.DataFrame:
 @dataclass
 class Dataset:
     X: pd.DataFrame            # tabular features at forecast origin t
-    seq: np.ndarray            # (n, n_lags, n_channels) sequences for the LSTM
+    seq: np.ndarray            # (n, n_lags, 3) own-zone sequence + target-month sin/cos (LSTM)
+    static: np.ndarray         # (n, k) other zones' anomalies at t (LSTM; k = 0 if univariate)
     y: pd.Series               # target anomaly at t+h
     origin: pd.DatetimeIndex   # forecast origin t
     target_time: pd.DatetimeIndex
@@ -39,7 +40,11 @@ class Dataset:
 def make_dataset(anom: pd.DataFrame, target: str, h: int, n_lags: int = 12,
                  cross_zone: bool = True) -> Dataset:
     """Features at origin t use only anomalies at t, t-1, ..., t-n_lags+1 (no leakage).
-    Calendar terms describe the *target* month, which is known in advance."""
+    Calendar terms describe the *target* month, which is known in advance.
+
+    The tabular features and the LSTM inputs carry the same information: the target zone's
+    last n_lags anomalies, the target month and (cross_zone) the other zones' anomalies at t.
+    The LSTM gets the first two as a sequence and the other zones as static inputs."""
     cols = list(anom.columns) if cross_zone else [target]
     a = anom[cols]
     feats = {}
@@ -56,17 +61,18 @@ def make_dataset(anom: pd.DataFrame, target: str, h: int, n_lags: int = 12,
     X["target_month_cos"] = np.cos(2 * np.pi * month / 12)
     y = anom[target].shift(-h).rename("y")
 
-    seq_cols = [target] + [c for c in cols if c != target]
-    arr = a[seq_cols].to_numpy()
-    seqs = np.full((len(anom), n_lags, len(seq_cols) + 2), np.nan)
+    arr = anom[target].to_numpy()
+    seqs = np.full((len(anom), n_lags, 3), np.nan)
     for i in range(n_lags - 1, len(anom)):
-        seqs[i, :, :len(seq_cols)] = arr[i - n_lags + 1:i + 1]
-    seqs[:, :, -2] = X["target_month_sin"].to_numpy()[:, None]
-    seqs[:, :, -1] = X["target_month_cos"].to_numpy()[:, None]
+        seqs[i, :, 0] = arr[i - n_lags + 1:i + 1]
+    seqs[:, :, 1] = X["target_month_sin"].to_numpy()[:, None]
+    seqs[:, :, 2] = X["target_month_cos"].to_numpy()[:, None]
+    static = a[[c for c in cols if c != target]].to_numpy()
 
     ok = X.notna().all(axis=1) & y.notna() & ~np.isnan(seqs).any(axis=(1, 2))
     idx = anom.index[ok]
-    return Dataset(X=X.loc[idx], seq=seqs[ok.to_numpy()], y=y.loc[idx], origin=idx,
+    okn = ok.to_numpy()
+    return Dataset(X=X.loc[idx], seq=seqs[okn], static=static[okn], y=y.loc[idx], origin=idx,
                    target_time=pd.DatetimeIndex(idx + pd.DateOffset(months=h)),
                    persistence=anom[target].loc[idx])
 
@@ -81,8 +87,20 @@ def split_mask(ds: Dataset, start: str | None, end: str) -> np.ndarray:
     return np.asarray(m)
 
 
+def fit_mask(ds: Dataset, eval_mask: np.ndarray) -> np.ndarray:
+    """Training samples for a model that is evaluated on ``eval_mask``: only those whose
+    target was observed by the earliest evaluation origin. A month's value is taken to be
+    available once that month ends, so a forecast issued at origin t may use labels up to
+    t. Splitting by target time alone is not enough at leads h > 1: a model fitted on
+    targets up to the month before the evaluation period would have seen labels that were
+    still in the future at the first h - 1 evaluation origins."""
+    cutoff = ds.origin[eval_mask].min()
+    return np.asarray(ds.target_time <= cutoff)
+
+
 def subset(ds: Dataset, mask: np.ndarray) -> Dataset:
-    return Dataset(X=ds.X[mask], seq=ds.seq[mask], y=ds.y[mask], origin=ds.origin[mask],
+    return Dataset(X=ds.X[mask], seq=ds.seq[mask], static=ds.static[mask], y=ds.y[mask],
+                   origin=ds.origin[mask],
                    target_time=ds.target_time[mask], persistence=ds.persistence[mask])
 
 
@@ -109,7 +127,8 @@ def fit_tree(kind: str, params: dict, X: pd.DataFrame, y: pd.Series, seed: int):
 
 
 class LSTMForecaster:
-    """Small LSTM on (n_lags × channels) anomaly sequences; early stopping on a
+    """Small LSTM on (n_lags × channels) anomaly sequences, with optional static inputs
+    joined to the final hidden state before the output layer; early stopping on a
     validation set; inputs standardised with training statistics."""
 
     def __init__(self, hidden: int = 32, layers: int = 1, dropout: float = 0.1, lr: float = 3e-3,
@@ -117,7 +136,8 @@ class LSTMForecaster:
         self.__dict__.update(hidden=hidden, layers=layers, dropout=dropout, lr=lr, weight_decay=weight_decay,
                              max_epochs=max_epochs, patience=patience, seed=seed)
 
-    def _net(self, n_in):
+    def _net(self, n_in, n_static):
+        import torch
         import torch.nn as nn
 
         class Net(nn.Module):
@@ -126,27 +146,38 @@ class LSTMForecaster:
                 s.lstm = nn.LSTM(n_in, self.hidden, self.layers, batch_first=True,
                                  dropout=self.dropout if self.layers > 1 else 0.0)
                 s.drop = nn.Dropout(self.dropout)
-                s.head = nn.Linear(self.hidden, 1)
+                s.head = nn.Linear(self.hidden + n_static, 1)
 
-            def forward(s, x):
+            def forward(s, x, z):
                 out, _ = s.lstm(x)
-                return s.head(s.drop(out[:, -1])).squeeze(-1)
+                return s.head(torch.cat([s.drop(out[:, -1]), z], dim=1)).squeeze(-1)
         return Net()
 
-    def fit(self, Xs, y, Xv=None, yv=None):
+    def _static(self, Xs, S):
+        return np.zeros((len(Xs), 0)) if S is None else np.asarray(S, dtype=float)
+
+    def _tensors(self, Xs, S):
+        import torch
+        S = self._static(Xs, S)
+        x = torch.tensor((Xs - self.mu) / self.sd, dtype=torch.float32)
+        z = torch.tensor((S - self.smu) / self.ssd, dtype=torch.float32)
+        return x, z
+
+    def fit(self, Xs, y, Xv=None, yv=None, S=None, Sv=None):
         import torch
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
+        S = self._static(Xs, S)
         self.mu = Xs.reshape(-1, Xs.shape[-1]).mean(0)
         self.sd = Xs.reshape(-1, Xs.shape[-1]).std(0) + 1e-8
+        self.smu, self.ssd = S.mean(0), S.std(0) + 1e-8
         self.ymu, self.ysd = float(np.mean(y)), float(np.std(y)) + 1e-8
-        f = lambda a: torch.tensor((a - self.mu) / self.sd, dtype=torch.float32)
         g = lambda a: torch.tensor((np.asarray(a) - self.ymu) / self.ysd, dtype=torch.float32)
-        xt, yt = f(Xs), g(y)
+        (xt, zt), yt = self._tensors(Xs, S), g(y)
         has_val = Xv is not None and len(Xv) > 0
         if has_val:
-            xv, yvt = f(Xv), g(yv)
-        self.net = self._net(Xs.shape[-1])
+            (xv, zv), yvt = self._tensors(Xv, Sv), g(yv)
+        self.net = self._net(Xs.shape[-1], S.shape[1])
         opt = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         best, best_state, wait = np.inf, None, 0
         gen = torch.Generator().manual_seed(self.seed)
@@ -156,13 +187,13 @@ class LSTMForecaster:
             for i in range(0, len(xt), 32):
                 b = perm[i:i + 32]
                 opt.zero_grad()
-                loss = torch.mean((self.net(xt[b]) - yt[b]) ** 2)
+                loss = torch.mean((self.net(xt[b], zt[b]) - yt[b]) ** 2)
                 loss.backward()
                 opt.step()
             if has_val:
                 self.net.eval()
                 with torch.no_grad():
-                    v = float(torch.mean((self.net(xv) - yvt) ** 2))
+                    v = float(torch.mean((self.net(xv, zv) - yvt) ** 2))
                 if v < best - 1e-5:
                     best, wait = v, 0
                     best_state = {k: t.clone() for k, t in self.net.state_dict().items()}
@@ -177,11 +208,11 @@ class LSTMForecaster:
             self.best_epoch = self.max_epochs
         return self
 
-    def predict(self, Xs):
+    def predict(self, Xs, S=None):
         import torch
         self.net.eval()
         with torch.no_grad():
-            p = self.net(torch.tensor((Xs - self.mu) / self.sd, dtype=torch.float32)).numpy()
+            p = self.net(*self._tensors(Xs, S)).numpy()
         return p * self.ysd + self.ymu
 
 

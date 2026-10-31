@@ -140,12 +140,45 @@ def test_forecast_features_use_only_past():
     np.testing.assert_allclose(ds.seq[10, 0, 0], an["z1"].shift(3).loc[t])
 
 
+def test_lstm_inputs_match_tabular_information():
+    """The LSTM sees the own-zone lags, target month and other zones at t, and nothing more."""
+    from src import forecasting as fc
+    an = _toy_anoms()
+    ds = fc.make_dataset(an, "z1", h=3, n_lags=4, cross_zone=True)
+    t = ds.origin[10]
+    assert ds.seq.shape[1:] == (4, 3)
+    np.testing.assert_allclose(ds.seq[10, :, 0], [ds.X.loc[t, f"z1_lag{k}"] for k in (3, 2, 1, 0)])
+    np.testing.assert_allclose(ds.seq[10, 0, 1:], ds.X.loc[t, ["target_month_sin", "target_month_cos"]])
+    assert ds.static.shape[1] == 1 and ds.static[10, 0] == ds.X.loc[t, "z2_lag0"]
+    assert fc.make_dataset(an, "z1", h=3, n_lags=4, cross_zone=False).static.shape[1] == 0
+
+
+def test_lstm_static_inputs_run():
+    from src import forecasting as fc
+    ds = fc.make_dataset(_toy_anoms(), "z1", h=1, n_lags=4)
+    m = fc.LSTMForecaster(hidden=4, max_epochs=3).fit(ds.seq, ds.y.to_numpy(), S=ds.static)
+    assert m.predict(ds.seq[:5], ds.static[:5]).shape == (5,)
+
+
 def test_split_by_target_time_prevents_leakage():
     from src import forecasting as fc
     ds = fc.make_dataset(_toy_anoms(), "z1", h=6)
     tr = fc.subset(ds, fc.split_mask(ds, None, "2005-12-31"))
     te = fc.subset(ds, fc.split_mask(ds, "2006-01-01", "2012-12-31"))
     assert tr.target_time.max() < te.target_time.min()
+
+
+def test_fit_cutoff_respects_forecast_origin():
+    """At lead h, a model evaluated from target month T may only be fitted on labels
+    observed by the first origin T - h, not on the h - 1 months before T."""
+    from src import forecasting as fc
+    for h in (1, 3, 6):
+        ds = fc.make_dataset(_toy_anoms(), "z1", h=h)
+        te = fc.split_mask(ds, "2006-01-01", "2012-12-31")
+        fit = fc.subset(ds, fc.fit_mask(ds, te))
+        first_origin = ds.origin[te].min()
+        assert first_origin == pd.Timestamp("2006-01-01") - pd.DateOffset(months=h)
+        assert fit.target_time.max() == first_origin
 
 
 def test_diebold_mariano_direction():

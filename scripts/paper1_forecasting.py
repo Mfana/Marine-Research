@@ -4,8 +4,10 @@ Data: ESA CCI / C3S satellite SST zone series (monthly, 1993–2024), six zones.
 Design: anomalies vs a training-period climatology; horizons 1, 3, 6 months; feature sets
 'univariate' (own 12 lags) and 'multizone' (+ current anomalies of the other zones);
 models climatology, anomaly persistence, ridge, Random Forest, XGBoost, LSTM.
-Splits by target time: train 1994–2015, validation 2016–2019 (tuning), test 2020–2024
-(evaluated once, after refitting on train+validation with the tuned settings).
+Evaluation periods by target time: validation 2016–2019 (tuning), test 2020–2024 (evaluated
+once, after refitting with the tuned settings). Every model is fitted only on targets observed
+by the first origin of the period it is evaluated on (fc.fit_mask), so at lead h the fitting
+data end h - 1 months before the period starts.
 
 Outputs: papers/paper1/{tables,figures}/ and data/processed/paper1_test_predictions.csv
 
@@ -34,8 +36,8 @@ ROOT = utils.PROJECT_ROOT
 OUT = ROOT / "papers" / "paper1"
 TAB, FIG = OUT / "tables", OUT / "figures"
 
-TRAIN_END, VAL_START, VAL_END, TEST_START, TEST_END = (
-    "2015-12-31", "2016-01-01", "2019-12-31", "2020-01-01", "2024-12-31")
+CLIM_END, VAL_START, VAL_END, TEST_START, TEST_END = (
+    "2014-12-31", "2016-01-01", "2019-12-31", "2020-01-01", "2024-12-31")
 HORIZONS = (1, 3, 6)
 FEATURE_SETS = ("univariate", "multizone")
 N_SEEDS = 5
@@ -56,20 +58,22 @@ def mse(y, p):
 
 
 def tune_and_test(ds, kind, seed, log):
-    tr = fc.subset(ds, fc.split_mask(ds, None, TRAIN_END))
-    va = fc.subset(ds, fc.split_mask(ds, VAL_START, VAL_END))
-    trva = fc.subset(ds, fc.split_mask(ds, None, VAL_END))
-    te = fc.subset(ds, fc.split_mask(ds, TEST_START, TEST_END))
+    va_mask = fc.split_mask(ds, VAL_START, VAL_END)
+    te_mask = fc.split_mask(ds, TEST_START, TEST_END)
+    tr, va = fc.subset(ds, fc.fit_mask(ds, va_mask)), fc.subset(ds, va_mask)
+    trva, te = fc.subset(ds, fc.fit_mask(ds, te_mask)), fc.subset(ds, te_mask)
     best, best_params, best_extra = np.inf, None, {}
     for params in GRIDS[kind]:
         if kind == "lstm":
-            m = fc.LSTMForecaster(seed=seed, **params).fit(tr.seq, tr.y.to_numpy(), va.seq, va.y.to_numpy())
-            v = mse(va.y, m.predict(va.seq))
+            m = fc.LSTMForecaster(seed=seed, **params).fit(tr.seq, tr.y.to_numpy(), va.seq, va.y.to_numpy(),
+                                                           S=tr.static, Sv=va.static)
+            v = mse(va.y, m.predict(va.seq, va.static))
             extra = {"epochs": m.best_epoch}
         else:
             m = fc.fit_tree(kind, dict(params), tr.X, tr.y, seed)
             v = mse(va.y, m.predict(va.X))
             extra = {}
+        extra["n_fit"] = len(tr.y)
         if v < best:
             best, best_params, best_extra = v, params, extra
     # Refit on train+validation with tuned settings; evaluate the test set once.
@@ -77,13 +81,14 @@ def tune_and_test(ds, kind, seed, log):
         preds, vals = [], []
         for s in range(N_SEEDS):
             m = fc.LSTMForecaster(seed=seed + s, max_epochs=max(best_extra["epochs"], 20), **best_params)
-            m.fit(trva.seq, trva.y.to_numpy())
-            preds.append(m.predict(te.seq))
+            m.fit(trva.seq, trva.y.to_numpy(), S=trva.static)
+            preds.append(m.predict(te.seq, te.static))
         preds = np.array(preds)
         seed_rmse = [float(np.sqrt(mse(te.y, p))) for p in preds]
-        return preds.mean(0), best_params | best_extra, {"val_mse": best, "seed_rmse": seed_rmse}, None
+        return preds.mean(0), best_params | best_extra, {"val_mse": best, "n_refit": len(trva.y),
+                                                         "seed_rmse": seed_rmse}, None
     m = fc.fit_tree(kind, dict(best_params), trva.X, trva.y, seed)
-    return m.predict(te.X), best_params, {"val_mse": best}, m
+    return m.predict(te.X), best_params | best_extra, {"val_mse": best, "n_refit": len(trva.y)}, m
 
 
 def main() -> None:
@@ -100,7 +105,9 @@ def main() -> None:
     zones = ["benguela_nearshore", "benguela_shelf", "benguela_offshore",
              "agulhas_nearshore", "agulhas_shelf", "agulhas_offshore"]
     df = df[zones].loc[:TEST_END]
-    clim = fc.train_climatology(df, TRAIN_END)
+    # Climatology from complete years that end before every evaluation origin (the earliest,
+    # at lead 6, is July 2015), so no anomaly used in tuning depends on later observations.
+    clim = fc.train_climatology(df, CLIM_END)
     anom = fc.to_anomalies(df, clim)
 
     rows, preds_all, dm_rows, tuned, tree_models = [], [], [], [], {}
@@ -170,8 +177,9 @@ def main() -> None:
         pickle.dump({k: (v[0].values, v[0].base_values, v[1]) for k, v in shap_store.items()}, f)
 
     meta = {"seconds": round(time.time() - t_all), "zones": zones, "horizons": HORIZONS,
-            "splits": {"train": f"1994..{TRAIN_END}", "validation": f"{VAL_START}..{VAL_END}",
-                       "test": f"{TEST_START}..{TEST_END}"},
+            "climatology": f"1993..{CLIM_END}",
+            "evaluation_targets": {"validation": f"{VAL_START}..{VAL_END}", "test": f"{TEST_START}..{TEST_END}"},
+            "fitting_cutoff": "targets up to the first origin of the evaluated period (lead h: h-1 months before it)",
             "n_seeds_lstm": N_SEEDS, "grids": {k: len(v) for k, v in GRIDS.items()},
             "torch": torch.__version__}
     (TAB / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
