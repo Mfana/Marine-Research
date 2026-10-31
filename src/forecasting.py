@@ -98,6 +98,38 @@ def fit_mask(ds: Dataset, eval_mask: np.ndarray) -> np.ndarray:
     return np.asarray(ds.target_time <= cutoff)
 
 
+def evaluation_masks(ds: Dataset, val_start: str, val_end: str,
+                     test_start: str, test_end: str) -> tuple[np.ndarray, ...]:
+    """Keep *selection*, including early stopping, available at the first test origin.
+
+    Target-date disjointness and an origin-safe final fit alone are insufficient:
+    validation outcomes used to select hyperparameters must also be observed then.
+    """
+    te = split_mask(ds, test_start, test_end)
+    if not te.any():
+        raise ValueError("empty evaluation period")
+    cutoff = ds.origin[te].min()
+    va = split_mask(ds, val_start, val_end) & (ds.target_time <= cutoff)
+    if not va.any():
+        raise ValueError("empty validation period before first evaluation origin")
+    tr, refit = fit_mask(ds, va), fit_mask(ds, te)
+    assert ds.target_time[va].max() <= cutoff
+    assert ds.target_time[tr].max() <= ds.origin[va].min()
+    return tr, va, refit, te
+
+
+def damped_persistence(train: Dataset, evaluation: Dataset) -> tuple[np.ndarray, float]:
+    """Direct, zero-intercept least-squares damping fitted separately at each lead.
+
+    Restrict the multiplier to [0, 1], so the baseline interpolates between anomaly
+    climatology and undamped persistence rather than adding an extrapolation model.
+    """
+    x, y = train.persistence.to_numpy(), train.y.to_numpy()
+    denom = float(x @ x)
+    beta = float(np.clip((x @ y) / denom, 0, 1)) if denom > 0 else 0.0
+    return beta * evaluation.persistence.to_numpy(), beta
+
+
 def subset(ds: Dataset, mask: np.ndarray) -> Dataset:
     return Dataset(X=ds.X[mask], seq=ds.seq[mask], static=ds.static[mask], y=ds.y[mask],
                    origin=ds.origin[mask],
@@ -180,6 +212,7 @@ class LSTMForecaster:
         self.net = self._net(Xs.shape[-1], S.shape[1])
         opt = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         best, best_state, wait = np.inf, None, 0
+        self.history_ = []
         gen = torch.Generator().manual_seed(self.seed)
         for epoch in range(self.max_epochs):
             self.net.train()
@@ -194,6 +227,10 @@ class LSTMForecaster:
                 self.net.eval()
                 with torch.no_grad():
                     v = float(torch.mean((self.net(xv, zv) - yvt) ** 2))
+                with torch.no_grad():
+                    train_loss = float(torch.mean((self.net(xt, zt) - yt) ** 2))
+                self.history_.append({"epoch": epoch + 1, "validation_mse_standardised": v,
+                                      "training_mse_standardised": train_loss})
                 if v < best - 1e-5:
                     best, wait = v, 0
                     best_state = {k: t.clone() for k, t in self.net.state_dict().items()}
@@ -232,15 +269,23 @@ def scores(y: np.ndarray, p: np.ndarray, clim_mse: float | None = None,
     return out
 
 
-def diebold_mariano(y, p1, p2, h: int = 1) -> tuple[float, float]:
+def diebold_mariano(y, p1, p2, h: int = 1, bandwidth: int | None = None) -> tuple[float, float]:
     """DM test with the Harvey–Leybourne–Newbold small-sample correction, squared-error
     loss. Negative statistic: forecast 1 more accurate. Returns (statistic, two-sided p)."""
     y, p1, p2 = map(np.asarray, (y, p1, p2))
     d = (p1 - y) ** 2 - (p2 - y) ** 2
     n = len(d)
     dbar = d.mean()
-    gamma = [np.mean((d[k:] - dbar) * (d[:n - k] - dbar)) for k in range(h)]
-    var = (gamma[0] + 2 * sum(gamma[1:])) / n
+    # Bartlett/Newey-West weights and denominator n give a nonnegative HAC
+    # estimator. Allow dependence beyond mechanical h-step forecast overlap.
+    automatic = int(np.floor(4 * (n / 100) ** (2 / 9)))
+    lag = min(n - 1, max(h - 1, automatic) if bandwidth is None else bandwidth)
+    if lag < 0:
+        raise ValueError("bandwidth must be nonnegative")
+    centered = d - dbar
+    gamma = [float(centered[k:] @ centered[:n-k]) / n for k in range(lag + 1)]
+    var = (gamma[0] + 2 * sum((1 - k / (lag + 1)) * gamma[k]
+                             for k in range(1, lag + 1))) / n
     if var <= 0:
         return np.nan, np.nan
     dm = dbar / np.sqrt(var)

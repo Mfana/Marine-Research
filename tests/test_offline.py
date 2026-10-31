@@ -118,6 +118,26 @@ def test_load_zone_series_defaults_to_coastal_source():
     assert df.index.freqstr == "MS"
 
 
+def test_static_cache_matches_domain_and_release(tmp_path, monkeypatch):
+    from src import data_access
+    monkeypatch.setattr(data_access, "PROJECT_ROOT", tmp_path)
+    folder=tmp_path/"data/cache"
+    folder.mkdir(parents=True)
+    cached=xr.Dataset({"deptho":(("latitude","longitude"),np.ones((2,2)))},
+                      coords={"latitude":[-36.,-28.],"longitude":[16.,34.]},
+                      attrs={"source_dataset_version":"202311"})
+    cached.to_netcdf(folder/"study_area_static.nc")
+    settings={"study_area":{"min_lon":16.,"max_lon":34.,"min_lat":-36.,"max_lat":-28.},
+              "dataset":{"dataset_version":"202311","datasets":{"static":"test"}}}
+    def no_remote(**kwargs):
+        raise RuntimeError("remote fallback")
+    monkeypatch.setattr(data_access.cm,"open_dataset",no_remote)
+    xr.testing.assert_equal(data_access.open_static(settings),cached)
+    settings["dataset"]["dataset_version"]="different"
+    with pytest.raises(RuntimeError,match="remote fallback"):
+        data_access.open_static(settings)
+
+
 def _toy_anoms(n=240, seed=0):
     rng = np.random.default_rng(seed)
     idx = pd.date_range("1993-01-01", periods=n, freq="MS")
@@ -179,6 +199,42 @@ def test_fit_cutoff_respects_forecast_origin():
         first_origin = ds.origin[te].min()
         assert first_origin == pd.Timestamp("2006-01-01") - pd.DateOffset(months=h)
         assert fit.target_time.max() == first_origin
+
+
+def test_model_selection_respects_first_test_origin():
+    from src import forecasting as fc
+    for h in (1, 3, 6):
+        ds = fc.make_dataset(_toy_anoms(n=384), "z1", h=h)
+        tr, va, refit, te = fc.evaluation_masks(ds, "2016-01-01", "2019-12-31",
+                                              "2020-01-01", "2024-12-31")
+        cutoff = ds.origin[te].min()
+        assert ds.target_time[va].max() <= cutoff
+        assert ds.target_time[refit].max() <= cutoff
+        assert ds.target_time[tr].max() <= ds.origin[va].min()
+        assert va.sum() == 49 - h
+        assert te.sum() == 60
+
+
+def test_damped_persistence_recovers_known_multiplier():
+    from src import forecasting as fc
+    ds = fc.make_dataset(_toy_anoms(), "z1", h=1)
+    ds.y = 0.4 * ds.persistence
+    prediction, beta = fc.damped_persistence(ds, ds)
+    np.testing.assert_allclose(beta, 0.4)
+    np.testing.assert_allclose(prediction, ds.y)
+
+
+def test_dm_hac_accounts_for_serially_correlated_loss():
+    from src import forecasting as fc
+    rng = np.random.default_rng(21)
+    loss = np.zeros(500)
+    for i in range(1, len(loss)):
+        loss[i] = 0.9 * loss[i-1] + rng.normal()
+    loss = loss - loss.min() + 0.1
+    y = np.zeros(len(loss))
+    independent, _ = fc.diebold_mariano(y, np.sqrt(loss), y, bandwidth=0)
+    dependent, _ = fc.diebold_mariano(y, np.sqrt(loss), y, bandwidth=12)
+    assert 0 < dependent < independent
 
 
 def test_diebold_mariano_direction():

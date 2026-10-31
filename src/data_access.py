@@ -12,7 +12,7 @@ from datetime import date
 import copernicusmarine as cm
 import xarray as xr
 
-from .utils import (estimate_uncompressed_mb, grid_cells, load_settings,
+from .utils import (PROJECT_ROOT, estimate_uncompressed_mb, grid_cells, load_settings,
                     months_between, setup_logging)
 
 log = setup_logging(name="marine.data_access")
@@ -91,6 +91,18 @@ def open_static(settings: dict | None = None, *, min_lon=None, max_lon=None, min
     Returns deptho (m), mask (1 = sea, surface level), e1t/e2t (m) and cell_area (m²).
     """
     settings = settings or load_settings()
+    cache = PROJECT_ROOT / "data/cache/study_area_static.nc"
+    if all(v is None for v in (min_lon,max_lon,min_lat,max_lat)) and cache.exists():
+        cached = xr.load_dataset(cache)
+        area = settings["study_area"]
+        actual = [float(cached.longitude.min()), float(cached.longitude.max()),
+                  float(cached.latitude.min()), float(cached.latitude.max())]
+        expected = [area[k] for k in ("min_lon", "max_lon", "min_lat", "max_lat")]
+        version = settings["dataset"].get("dataset_version")
+        if (all(abs(a-b) <= 1/12 for a,b in zip(actual,expected))
+                and (version is None or str(cached.attrs.get("source_dataset_version")) == str(version))):
+            return cached
+        cached.close()
     area = settings["study_area"]
     bounds = dict(minimum_longitude=area["min_lon"] if min_lon is None else min_lon,
                   maximum_longitude=area["max_lon"] if max_lon is None else max_lon,
@@ -99,9 +111,11 @@ def open_static(settings: dict | None = None, *, min_lon=None, max_lon=None, min
                   coordinates_selection_method="nearest")
     did = dataset_id(settings, "static")
     log.info("Opening static fields: %s", bounds)
-    bathy = cm.open_dataset(dataset_id=did, dataset_part="bathy", variables=["deptho", "mask"],
+    bathy = cm.open_dataset(dataset_id=did, dataset_version=settings["dataset"].get("dataset_version"),
+                            dataset_part="bathy", variables=["deptho", "mask"],
                             minimum_depth=0.494025, maximum_depth=0.494025, **bounds)
-    coords = cm.open_dataset(dataset_id=did, dataset_part="coords", variables=["e1t", "e2t"], **bounds)
+    coords = cm.open_dataset(dataset_id=did, dataset_version=settings["dataset"].get("dataset_version"),
+                             dataset_part="coords", variables=["e1t", "e2t"], **bounds)
     mask = bathy["mask"]
     if "depth" in mask.dims:
         mask = mask.isel(depth=0, drop=True)

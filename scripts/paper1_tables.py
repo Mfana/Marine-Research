@@ -16,7 +16,7 @@ ZONES = ["benguela_nearshore", "benguela_shelf", "benguela_offshore",
          "agulhas_nearshore", "agulhas_shelf", "agulhas_offshore"]
 ZL = {z: z.replace("_", " ").title() for z in ZONES}
 ML = {"climatology": "Climatology", "persistence": "Persistence", "ridge": "Ridge",
-      "random_forest": "RF", "xgboost": "XGBoost", "lstm": "LSTM"}
+      "damped_persistence": "Damped", "random_forest": "RF", "xgboost": "XGBoost", "lstm": "LSTM"}
 
 
 def zone_table():
@@ -25,11 +25,12 @@ def zone_table():
     r = pd.read_csv(TAB / "test_scores.csv")
     sd = r[(r.model == "climatology") & (r.h == 1)].set_index("zone")["RMSE"]
     lines = [r"\begin{tabular}{lrrrr}", r"\toprule",
-             r"Zone & Cells (0.05\textdegree) & Mean SST (\si{\celsius}) & Anomaly s.d. (\si{\celsius}) & Test anomaly s.d. (\si{\celsius}) \\",
+             r"Zone & Cells (0.05\textdegree) & Mean SST (\si{\celsius}) & Anomaly s.d. (\si{\celsius}) & Evaluation anomaly RMS (\si{\celsius}) \\",
              r"\midrule"]
     for z in ZONES:
         s = sat[z]
-        anom = s.groupby(s.index.month).transform(lambda x: x - x.mean())
+        clim = s.loc[:"2014"].groupby(s.loc[:"2014"].index.month).mean()
+        anom = s - clim.reindex(s.index.month).set_axis(s.index)
         lines.append(f"{ZL[z]} & {qc['satellite']['zone_cells'][z]:,} & {s.mean():.2f} & {anom.std():.2f} & {sd[z]:.2f} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}"]
     (TAB / "tab_zones.tex").write_text("\n".join(lines) + "\n")
@@ -38,14 +39,14 @@ def zone_table():
 def lead1_table():
     r = pd.read_csv(TAB / "test_scores.csv")
     d = r[(r.h == 1) & r.features.isin(["-", "multizone"])]
-    models = ["climatology", "persistence", "ridge", "random_forest", "xgboost", "lstm"]
+    models = ["climatology", "persistence", "damped_persistence", "ridge", "random_forest", "xgboost", "lstm"]
     rm = d.pivot_table(index="zone", columns="model", values="RMSE").loc[ZONES, models]
     lines = [r"\begin{tabular}{l" + "r" * len(models) + "}", r"\toprule",
              "Zone & " + " & ".join(ML[m] for m in models) + r" \\", r"\midrule"]
     for z in ZONES:
         row = rm.loc[z]
-        best = row[["ridge", "random_forest", "xgboost", "lstm"]].min()
-        cells = [(rf"\textbf{{{v:.3f}}}" if (m not in ("climatology", "persistence") and v == best) else f"{v:.3f}")
+        best = row[["ridge", "random_forest", "xgboost", "lstm"]].round(3).min()
+        cells = [(rf"\textbf{{{v:.3f}}}" if (m in ("ridge", "random_forest", "xgboost", "lstm") and round(v,3) == best) else f"{v:.3f}")
                  for m, v in row.items()]
         lines.append(f"{ZL[z]} & " + " & ".join(cells) + r" \\")
     ms = d.groupby("model")["MSSS_clim"].mean()
@@ -83,7 +84,7 @@ def dm_table():
     d = dm[dm.features == "multizone"]
     lines = [r"\begin{tabular}{llrrr}", r"\toprule",
              r"Model & Reference & Lead 1 & Lead 3 & Lead 6 \\", r"\midrule"]
-    for ref in ("persistence", "climatology"):
+    for ref in ("persistence", "climatology", "damped_persistence"):
         for m in ("ridge", "random_forest", "xgboost", "lstm"):
             x = d[(d.model == m) & (d.reference == ref)]
             cells = []

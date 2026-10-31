@@ -27,7 +27,8 @@ from src import data_access, preprocessing, utils  # noqa: E402
 
 def satellite_monthly(s: dict, log) -> xr.DataArray:
     v, a = s["validation"], s["study_area"]
-    ds = cm.open_dataset(dataset_id=v["dataset_id"], variables=[v["variable"]], service=v["service"],
+    ds = cm.open_dataset(dataset_id=v["dataset_id"], dataset_version=v["dataset_version"],
+                         variables=[v["variable"]], service=v["service"],
                          minimum_longitude=a["min_lon"], maximum_longitude=a["max_lon"],
                          minimum_latitude=a["min_lat"], maximum_latitude=a["max_lat"],
                          start_datetime=v["start"], end_datetime=v["end"])
@@ -43,6 +44,7 @@ def satellite_monthly(s: dict, log) -> xr.DataArray:
     out = xr.concat(bands, "latitude").rename("sst")
     out.attrs.update(units="degC", long_name="monthly mean sea surface temperature (~20 cm)",
                      source_product_id=v["product_id"], source_dataset_id=v["dataset_id"],
+                     source_dataset_version=v["dataset_version"],
                      source_title=v["product_title"], access_date=pd.Timestamp.today().date().isoformat(),
                      processing="daily analysed_sst -> calendar-month mean; K -> degC")
     return out

@@ -65,6 +65,7 @@ validation:
   product_id: SST_GLO_SST_L4_REP_OBSERVATIONS_010_024
   product_title: ESA SST CCI and C3S reprocessed sea surface temperature analyses
   dataset_id: C3S-GLO-SST-L4-REP-OBS-SST
+  dataset_version: "202506"  # pin the satellite analysis used for paper 1
   variable: analysed_sst        # kelvin; daily-mean SST at ~20 cm depth, 0.05° grid
   service: arco-time-series     # time-long chunks: far less transfer than geo-series for a region
   start: "1993-01-01"

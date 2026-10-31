@@ -4,10 +4,8 @@ Data: ESA CCI / C3S satellite SST zone series (monthly, 1993–2024), six zones.
 Design: anomalies vs a training-period climatology; horizons 1, 3, 6 months; feature sets
 'univariate' (own 12 lags) and 'multizone' (+ current anomalies of the other zones);
 models climatology, anomaly persistence, ridge, Random Forest, XGBoost, LSTM.
-Evaluation periods by target time: validation 2016–2019 (tuning), test 2020–2024 (evaluated
-once, after refitting with the tuned settings). Every model is fitted only on targets observed
-by the first origin of the period it is evaluated on (fc.fit_mask), so at lead h the fitting
-data end h - 1 months before the period starts.
+Retrospective, development-exposed evaluation: targets 2020–2024. Validation outcomes,
+early-stopping choices and fitting labels must all be observed at the first test origin.
 
 Outputs: papers/paper1/{tables,figures}/ and data/processed/paper1_test_predictions.csv
 
@@ -41,13 +39,14 @@ CLIM_END, VAL_START, VAL_END, TEST_START, TEST_END = (
 HORIZONS = (1, 3, 6)
 FEATURE_SETS = ("univariate", "multizone")
 N_SEEDS = 5
+N_TUNING_SEEDS = 3
 GRIDS = {
     "ridge": [{"alpha": a} for a in (0.1, 1.0, 10.0, 100.0)],
     "random_forest": [dict(max_depth=d, min_samples_leaf=l, max_features=f)
                       for d, l, f in itertools.product((3, 6, None), (1, 5, 10), (0.33, 1.0))],
     "xgboost": [dict(max_depth=d, learning_rate=lr, n_estimators=n, min_child_weight=w)
                 for d, lr, n, w in itertools.product((2, 3, 4), (0.03, 0.1), (200, 600), (1, 5))],
-    # Comparable tuning effort to the tree models (12 configurations).
+    # Explicit model-specific grid; configuration counts do not establish equal effort.
     "lstm": [dict(hidden=h, dropout=d, lr=lr)
              for h, d, lr in itertools.product((8, 16, 32), (0.1, 0.3), (1e-3, 3e-3))],
 }
@@ -57,18 +56,23 @@ def mse(y, p):
     return float(np.mean((np.asarray(p) - np.asarray(y)) ** 2))
 
 
-def tune_and_test(ds, kind, seed, log):
-    va_mask = fc.split_mask(ds, VAL_START, VAL_END)
-    te_mask = fc.split_mask(ds, TEST_START, TEST_END)
-    tr, va = fc.subset(ds, fc.fit_mask(ds, va_mask)), fc.subset(ds, va_mask)
-    trva, te = fc.subset(ds, fc.fit_mask(ds, te_mask)), fc.subset(ds, te_mask)
+def tune_and_test(ds, kind, seed, log, val_start=VAL_START, val_end=VAL_END,
+                  test_start=TEST_START, test_end=TEST_END):
+    tr_mask, va_mask, refit_mask, te_mask = fc.evaluation_masks(
+        ds, val_start, val_end, test_start, test_end)
+    tr, va = fc.subset(ds, tr_mask), fc.subset(ds, va_mask)
+    trva, te = fc.subset(ds, refit_mask), fc.subset(ds, te_mask)
     best, best_params, best_extra = np.inf, None, {}
     for params in GRIDS[kind]:
         if kind == "lstm":
-            m = fc.LSTMForecaster(seed=seed, **params).fit(tr.seq, tr.y.to_numpy(), va.seq, va.y.to_numpy(),
-                                                           S=tr.static, Sv=va.static)
-            v = mse(va.y, m.predict(va.seq, va.static))
-            extra = {"epochs": m.best_epoch}
+            seed_preds, epochs = [], []
+            for s in range(N_TUNING_SEEDS):
+                m = fc.LSTMForecaster(seed=seed + s, **params).fit(
+                    tr.seq, tr.y.to_numpy(), va.seq, va.y.to_numpy(), S=tr.static, Sv=va.static)
+                seed_preds.append(m.predict(va.seq, va.static))
+                epochs.append(m.best_epoch)
+            v = mse(va.y, np.mean(seed_preds, axis=0))
+            extra = {"epochs": epochs}
         else:
             m = fc.fit_tree(kind, dict(params), tr.X, tr.y, seed)
             v = mse(va.y, m.predict(va.X))
@@ -76,11 +80,17 @@ def tune_and_test(ds, kind, seed, log):
         extra["n_fit"] = len(tr.y)
         if v < best:
             best, best_params, best_extra = v, params, extra
-    # Refit on train+validation with tuned settings; evaluate the test set once.
+    best_extra.update(n_validation=len(va.y), validation_end=str(va.target_time.max().date()),
+                      first_test_origin=str(te.origin.min().date()),
+                      fit_end=str(tr.target_time.max().date()), refit_end=str(trva.target_time.max().date()))
+    # Each refit seed uses its validation-selected epoch; new seeds use the median.
+    # There is no post-selection epoch floor.
     if kind == "lstm":
         preds, vals = [], []
         for s in range(N_SEEDS):
-            m = fc.LSTMForecaster(seed=seed + s, max_epochs=max(best_extra["epochs"], 20), **best_params)
+            epoch_list = best_extra["epochs"]
+            epochs = epoch_list[s] if s < len(epoch_list) else int(np.median(epoch_list))
+            m = fc.LSTMForecaster(seed=seed + s, max_epochs=epochs, **best_params)
             m.fit(trva.seq, trva.y.to_numpy(), S=trva.static)
             preds.append(m.predict(te.seq, te.static))
         preds = np.array(preds)
@@ -117,7 +127,10 @@ def main() -> None:
         ds = fc.make_dataset(anom, z, h, n_lags=12, cross_zone=(fs == "multizone"))
         te = fc.subset(ds, fc.split_mask(ds, TEST_START, TEST_END))
         y = te.y.to_numpy()
-        base = {"climatology": np.zeros_like(y), "persistence": te.persistence.to_numpy()}
+        refit = fc.subset(ds, fc.fit_mask(ds, fc.split_mask(ds, TEST_START, TEST_END)))
+        dp, beta = fc.damped_persistence(refit, te)
+        base = {"climatology": np.zeros_like(y), "persistence": te.persistence.to_numpy(),
+                "damped_persistence": dp}
         clim_mse, pers_mse = mse(y, base["climatology"]), mse(y, base["persistence"])
         preds = dict(base)
         for kind in ("ridge", "random_forest", "xgboost", "lstm"):
@@ -137,19 +150,24 @@ def main() -> None:
                                            "y_anom": y, "pred_anom": p,
                                            "clim": clim.loc[te.target_time.month, z].to_numpy()}))
         for name in ("ridge", "random_forest", "xgboost", "lstm"):
-            for ref in ("persistence", "climatology"):
+            for ref in ("persistence", "climatology", "damped_persistence"):
                 st, pv = fc.diebold_mariano(y, preds[name], preds[ref], h)
                 dm_rows.append({"zone": z, "h": h, "features": fs, "model": name, "reference": ref,
                                 "dm_stat": st, "p_value": pv})
         st, pv = fc.diebold_mariano(y, preds["xgboost"], preds["lstm"], h)
         dm_rows.append({"zone": z, "h": h, "features": fs, "model": "xgboost", "reference": "lstm",
                         "dm_stat": st, "p_value": pv})
+        for ref in ("random_forest", "xgboost", "lstm"):
+            st, pv = fc.diebold_mariano(y, preds["ridge"], preds[ref], h)
+            dm_rows.append({"zone": z, "h": h, "features": fs, "model": "ridge", "reference": ref,
+                            "dm_stat": st, "p_value": pv})
         log.info("%s h=%d %s done in %.0fs", z, h, fs, time.time() - t0)
 
     res = pd.DataFrame(rows)
     # Baselines do not depend on the feature set; keep one copy.
-    res = res[~((res.features == "univariate") & res.model.isin(["climatology", "persistence"]))]
-    res.loc[res.model.isin(["climatology", "persistence"]), "features"] = "-"
+    baselines = ["climatology", "persistence", "damped_persistence"]
+    res = res[~((res.features == "univariate") & res.model.isin(baselines))]
+    res.loc[res.model.isin(baselines), "features"] = "-"
     res.round(4).to_csv(TAB / "test_scores.csv", index=False)
     pd.DataFrame(tuned).to_csv(TAB / "tuned_hyperparameters.csv", index=False)
 
@@ -166,7 +184,8 @@ def main() -> None:
     for (z, h, fs), (model, X) in tree_models.items():
         if fs != "multizone":
             continue
-        sv = shap.TreeExplainer(model)(X)
+        sv = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent",
+                                model_output="raw")(X)
         imp = np.abs(sv.values).mean(0)
         for f, v in zip(X.columns, imp):
             shap_rows.append({"zone": z, "h": h, "feature": f, "mean_abs_shap": v})
@@ -179,7 +198,11 @@ def main() -> None:
     meta = {"seconds": round(time.time() - t_all), "zones": zones, "horizons": HORIZONS,
             "climatology": f"1993..{CLIM_END}",
             "evaluation_targets": {"validation": f"{VAL_START}..{VAL_END}", "test": f"{TEST_START}..{TEST_END}"},
-            "fitting_cutoff": "targets up to the first origin of the evaluated period (lead h: h-1 months before it)",
+            "selection_and_refit_cutoff": "all validation targets and refit labels <= earliest test origin",
+            "evaluation_status": "exploratory; 2020–2024 inspected during earlier development",
+            "n_dm_tests": len(dm), "hac": "Bartlett, max(h-1, floor(4*(n/100)^(2/9)))",
+            "n_tuning_seeds_lstm": N_TUNING_SEEDS, "refit_epoch_rule": "per-seed selected epoch; median for new seeds; no floor",
+            "shap": shap.__version__, "shap_feature_perturbation": "tree_path_dependent",
             "n_seeds_lstm": N_SEEDS, "grids": {k: len(v) for k, v in GRIDS.items()},
             "torch": torch.__version__}
     (TAB / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))

@@ -95,6 +95,10 @@ def main(ams_dir: str) -> None:
     end = src.index("\\section*{Code and data availability}")
     body = src[start:end]
     body = re.sub(r"%% -+\n", "", body)
+    # Expand generated result prose before table inlining; retain generated numeric
+    # macros in the AMS preamble so both manuscripts use the same results.
+    body = re.sub(r"\\input\{tables/(results_[^}]+\.tex)\}",
+                  lambda m: (SRC/"tables"/m.group(1)).read_text().strip(), body)
     body = inline_tables(body)
     body, figs = rename_figures(body)
     body = convert_refs(body)
@@ -110,7 +114,11 @@ def main(ams_dir: str) -> None:
 
 \usepackage{{booktabs}}
 \usepackage{{siunitx}}
+\usepackage{{url,placeins}}
+\providecommand{{\nolinkurl}}{{\url}}
 \sisetup{{detect-all}}
+\emergencystretch=2em
+{(SRC / 'tables/result_numbers.tex').read_text()}
 
 \title{{{TITLE}}}
 
@@ -135,9 +143,8 @@ def main(ams_dir: str) -> None:
 
 \end{{document}}
 """
-    if OUT.exists():
-        shutil.rmtree(OUT)
-    OUT.mkdir(parents=True)
+    # Update the existing package without deleting unrelated author files.
+    OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "main.tex").write_text(tex)
     shutil.copy(ams / "ametsocV6.2.cls", OUT)
     shutil.copy(ams / "ametsocV6.bst", OUT)
