@@ -12,6 +12,8 @@ Usage:  .venv/bin/python scripts/cache_daily_satellite.py
 
 import sys
 import time
+import hashlib
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,7 +39,8 @@ def main() -> None:
     v, a = s["validation"], s["study_area"]
     t_all = time.time()
 
-    ds = cm.open_dataset(dataset_id=v["dataset_id"], variables=[v["variable"]], service=v["service"],
+    ds = cm.open_dataset(dataset_id=v["dataset_id"], dataset_version=v["dataset_version"],
+                         variables=[v["variable"]], service=v["service"],
                          minimum_longitude=a["min_lon"], maximum_longitude=a["max_lon"],
                          minimum_latitude=a["min_lat"], maximum_latitude=a["max_lat"],
                          start_datetime=v["start"], end_datetime=v["end"])
@@ -66,8 +69,16 @@ def main() -> None:
     blocks = [(t0, t1, r0, min(r0 + LAT_BAND, n_lat)) for t0, t1 in zip(edges[:-1], edges[1:])
               for r0 in range(0, n_lat, LAT_BAND)]
     # Checkpoint after every block so a network failure resumes instead of re-fetching.
-    ckpt_dir = CACHE / "_daily_checkpoints"
-    ckpt_dir.mkdir(exist_ok=True)
+    fingerprint = {"dataset_id": v["dataset_id"], "dataset_version": str(v["dataset_version"]),
+                   "variable": v["variable"], "start": v["start"], "end": v["end"],
+                   "study_area": a, "zones": s["zones"], "sub_regions": s["sub_regions"],
+                   "coarsen": COARSEN,
+                   "mask_hash": hashlib.sha256(b"".join(m.values.tobytes() for m in masks.values())).hexdigest()}
+    key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
+    ckpt_dir = CACHE / "_daily_checkpoints" / key
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "provenance.json").write_text(json.dumps({**fingerprint, "returned_dataset_attrs": dict(ds.attrs)},
+                                                      indent=2, default=str))
     for i, (t0, t1, r0, r1) in enumerate(blocks):
         ckpt = ckpt_dir / f"block_{t0}_{r0}.npz"
         nb = (r1 - r0) // COARSEN
@@ -120,9 +131,13 @@ def main() -> None:
                       attrs={"units": "degC", "processing": "daily analysed_sst, K->degC, 5x5 block mean (0.05->0.25 deg), "
                              "cells with any sea pixel kept", "source_product_id": v["product_id"],
                              "source_dataset_id": v["dataset_id"],
+                             "source_dataset_version": str(v["dataset_version"]),
+                             "extraction_fingerprint": key,
                              "access_date": pd.Timestamp.today().date().isoformat()})
     da.to_dataset().to_netcdf(CACHE / "sst_satellite_daily_025deg_1993_2024.nc",
                               encoding={"sst": {"zlib": True, "complevel": 4}})
+    (CACHE / "sst_satellite_daily_provenance.json").write_text(
+        json.dumps({**fingerprint, "returned_dataset_attrs": dict(ds.attrs), "key": key}, indent=2, default=str))
     print(zones.describe().round(2))
     print("missing days per zone:", zones.isna().sum().to_dict())
     for f in ("sst_satellite_daily_zones_1993_2024.csv", "sst_satellite_daily_025deg_1993_2024.nc"):

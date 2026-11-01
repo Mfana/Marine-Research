@@ -42,15 +42,23 @@ def climatology(values: np.ndarray, index: pd.DatetimeIndex, baseline: tuple[str
     shape = (366,) + values.shape[1:]
     seas, thresh = np.full(shape, np.nan), np.full(shape, np.nan)
     for day in range(1, 367):
-        dist = np.abs(d - day)
-        dist = np.minimum(dist, 366 - dist)
-        sel = v[dist <= window_half_width]
+        if day == 60:
+            continue
+        # Actual consecutive days around each calendar date, clipped to the baseline.
+        # This matches marineHeatWaves with a baseline-only alternateClimatology and
+        # cannot draw evaluation-period observations across a training boundary.
+        centres = np.flatnonzero(d == day)
+        positions = (centres[:, None] + np.arange(-window_half_width, window_half_width + 1)).ravel()
+        positions = positions[(positions >= 0) & (positions < len(v))]
+        sel = v[positions]
         with np.errstate(all="ignore"):
             import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 seas[day - 1] = np.nanmean(sel, axis=0)
                 thresh[day - 1] = np.nanpercentile(sel, pctile, axis=0)
+    seas[59] = (seas[58] + seas[60]) / 2
+    thresh[59] = (thresh[58] + thresh[60]) / 2
     return _circular_smooth(seas, smooth_width), _circular_smooth(thresh, smooth_width)
 
 
@@ -102,9 +110,10 @@ def detect(sst: pd.Series, baseline: tuple[str, str] = ("1993-01-01", "2022-12-3
         anom = seg["anomaly"].to_numpy()
         diff = (seg["thresh"] - seg["seas"]).to_numpy()
         peak = int(np.nanargmax(anom))
-        ratio = anom[peak] / diff[peak] if diff[peak] > 0 else np.nan
+        ratio = np.nanmax(np.divide(anom, diff, out=np.full_like(anom, np.nan), where=diff > 0))
         category = int(min(max(np.floor(ratio), 1), 4)) if np.isfinite(ratio) else 1
-        onset_rate = (anom[peak] - (daily["anomaly"].iloc[s - 1] if s > 0 else anom[0])) / (peak + 1)
+        onset_rate = ((anom[peak] - 0.5 * (daily["anomaly"].iloc[s - 1] + anom[0])) / (peak + 0.5)
+                      if s > 0 else (anom[peak] - anom[0]) / max(peak, 1))
         rows.append({"event_id": i, "start": seg.index[0], "end": seg.index[-1], "peak": seg.index[peak],
                      "duration_days": e - s + 1, "intensity_max": float(anom[peak]),
                      "intensity_mean": float(np.nanmean(anom)), "intensity_cumulative": float(np.nansum(anom)),
@@ -113,7 +122,9 @@ def detect(sst: pd.Series, baseline: tuple[str, str] = ("1993-01-01", "2022-12-3
     cat = pd.Series(0, index=idx)
     for r in rows:
         cat.loc[r["start"]:r["end"]] = r["category"]
-    daily["category"] = cat.to_numpy()
+    daily["event_category"] = cat.to_numpy()
+    ratio = np.divide(x - seas, thresh - seas, out=np.zeros_like(x), where=thresh > seas)
+    daily["category"] = np.where(in_mhw, np.clip(np.floor(ratio), 0, 4), 0).astype(int)
     return daily, events
 
 

@@ -28,7 +28,7 @@ def example_event_panel():
     from src import mhw
     daily = pd.read_csv(ROOT / "data/cache/sst_satellite_daily_zones_1993_2024.csv", index_col=0, parse_dates=True)
     ev = pd.read_csv(TAB / "events.csv", parse_dates=["start", "end", "peak"])
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.2))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
     for ax, z in zip(axes, ("benguela_nearshore", "agulhas_offshore")):
         d, _ = mhw.detect(daily[z], baseline=("1993-01-01", "2022-12-31"))
         e = ev[ev.zone == z].sort_values("intensity_cumulative").iloc[-1]
@@ -37,9 +37,9 @@ def example_event_panel():
         ax.plot(win.index, win.seas, color="#2563eb", lw=1, label="Climatology")
         ax.plot(win.index, win.thresh, color="#16a34a", lw=1, ls="--", label="90th percentile")
         ax.fill_between(win.index, win.thresh, win.sst, where=win.in_mhw, color="#dc2626", alpha=0.5, label="MHW")
-        ax.set(title=f"{ZONE_LABEL[z]}: largest event ({e.start:%b %Y}, {int(e.duration_days)} d)", ylabel="SST (°C)")
+        ax.set(title=f"{ZONE_LABEL[z]}\n{e.start:%b %Y}, {int(e.duration_days)} days", ylabel="SST (°C)")
         ax.tick_params(axis="x", labelrotation=30)
-    axes[0].legend(fontsize=7)
+    axes[0].legend(fontsize=10)
     visualisation.source_note(axes[1], CREDIT)
     fig.tight_layout()
     visualisation.save(fig, "fig_example_events", FIG)
@@ -48,13 +48,13 @@ def example_event_panel():
 
 def annual_mhw_days():
     a = pd.read_csv(TAB / "annual_metrics.csv")
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.4), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), sharey=True)
     for ax, region in zip(axes, ("benguela", "agulhas")):
         for z in [z for z in ZONES if z.startswith(region)]:
             d = a[a.zone == z]
-            ax.plot(d.year, d.mhw_days, marker="o", ms=2.5, color=ZONE_COLORS[z], label=ZONE_LABEL[z])
+            ax.plot(d.year, d.mhw_days, marker="o", ms=2.5, color=ZONE_COLORS[z], label=z.split("_")[1].title())
         ax.set(title=f"{region.title()}: annual MHW days", xlabel="Year")
-        ax.legend(fontsize=7)
+        ax.legend(fontsize=10)
     axes[0].set_ylabel("MHW days per year")
     visualisation.source_note(axes[1], CREDIT)
     fig.tight_layout()
@@ -64,16 +64,25 @@ def annual_mhw_days():
 
 def grid_maps():
     g = xr.open_dataset(ROOT / "data/processed/paper2_mhw_grid.nc")
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.3), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6), sharey=True)
     m1 = g.mean_annual_mhw_days.plot(ax=axes[0], cmap="YlOrRd", add_colorbar=False)
     fig.colorbar(m1, ax=axes[0], label="MHW days per year")
     lim = float(np.nanpercentile(np.abs(g.trend_mhw_days_per_decade), 98))
     m2 = g.trend_mhw_days_per_decade.plot(ax=axes[1], cmap="RdBu_r", vmin=-lim, vmax=lim, add_colorbar=False)
     fig.colorbar(m2, ax=axes[1], label="Trend (days per year per decade)")
-    axes[0].set(title="Mean annual MHW days, 1993–2024", xlabel="Longitude (°E)", ylabel="Latitude (°N)")
+    axes[0].set(title="Mean annual MHW days, 1993–2024", xlabel="Longitude (°E)", ylabel="Latitude")
     axes[1].set(title="Trend in annual MHW days", xlabel="Longitude (°E)", ylabel="")
     for ax in axes:
         ax.axvline(20, color="k", ls="--", lw=0.6)
+        from matplotlib.ticker import FuncFormatter
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{abs(v):g}°S"))
+        coarse = xr.open_dataset(ROOT / "data/cache/sst_satellite_daily_025deg_1993_2024.nc").sst
+        sea = coarse.notnull().any("time")
+        ax.contour(sea.longitude, sea.latitude, sea.astype(float), levels=[.5], colors="0.3", linewidths=.6)
+        from src import data_access, preprocessing
+        original = data_access.load_monthly_grid("satellite", utils.load_settings()).notnull().any("time")
+        distance = preprocessing.distance_to_land_km(original).interp(latitude=sea.latitude,longitude=sea.longitude,method="nearest")
+        ax.contour(sea.longitude, sea.latitude, distance, levels=[50,100], colors="0.3",linewidths=.4,linestyles=":")
         ax.grid(False)
     visualisation.source_note(axes[1], CREDIT + " (0.25° daily)")
     fig.tight_layout()
@@ -88,38 +97,39 @@ def unsupervised():
     lab = {"zscore_run5": "z-score rule", "isolation_forest": "Isolation Forest", "isolation_forest_warm": "IF (warm-only)",
            "autoencoder": "Autoencoder", "autoencoder_warm": "AE (warm-only)"}
     base = u.groupby("zone")["base_rate"].first().loc[ZONES]
-    fig, ax = plt.subplots(figsize=(9, 3.4))
+    fig, ax = plt.subplots(figsize=(9, 4.2))
     x = np.arange(len(ZONES))
     w = 0.15
     for i, c in enumerate(cols):
         ax.bar(x + (i - 2) * w, d[c], w, label=lab[c])
     ax.scatter(x, base, marker="_", s=400, color="k", label="Base rate (no skill)", zorder=3)
-    ax.set_xticks(x, [ZONE_LABEL[z] for z in ZONES], rotation=20, ha="right", fontsize=8)
-    ax.set(ylabel="Test AUPRC", title="Unsupervised detection of Hobday MHW days, 2020–2024")
-    ax.legend(fontsize=7, ncol=3)
+    ax.set_xticks(x, [z.replace("benguela_","B ").replace("agulhas_","A ") for z in ZONES], fontsize=11)
+    ax.set(ylabel="Test average precision")
+    ax.set_title("Index emulation: tested anomaly scores, 2020–2024",pad=48)
+    ax.legend(fontsize=10, ncol=3,loc="lower center",bbox_to_anchor=(.5,1.02))
     fig.tight_layout()
     visualisation.save(fig, "fig_unsupervised_detection", FIG)
     plt.close(fig)
 
 
 def early_warning():
-    e = pd.read_csv(TAB / "early_warning_test.csv")
-    fig, axes = plt.subplots(2, 3, figsize=(11, 5.4), sharex=True, sharey=True)
+    e = pd.read_csv(TAB / "forecast_scores_extended.csv")
+    fig, axes = plt.subplots(2, 3, figsize=(9, 5.6), sharex=True, sharey=True)
     for ax, z in zip(axes.ravel(), ZONES):
         d = e[e.zone == z]
-        for m in ("persistence", "logistic", "random_forest", "xgboost"):
+        for m in ("threshold_distance", "univariate_logistic", "logistic", "xgboost"):
             dm = d[d.model == m].sort_values("lead_days")
-            ax.plot(dm.lead_days, dm.AUPRC, marker="o", ms=3, color=MCOLOR[m], label=MLABEL[m],
+            ax.plot(dm.lead_days, dm.AUPRC, marker="o", ms=3, color=MCOLOR.get(m,"#7c3aed" if m=="threshold_distance" else "#16a34a"), label=MLABEL.get(m,"Threshold distance" if m=="threshold_distance" else "Univariate logistic"),
                     ls="--" if m == "persistence" else "-")
         b = d[d.model == "base_rate"].sort_values("lead_days")
         ax.plot(b.lead_days, b.base_rate, color="0.6", ls=":", label="Base rate")
-        ax.set_title(ZONE_LABEL[z], fontsize=9)
+        ax.set_title(ZONE_LABEL[z], fontsize=11)
         ax.set_xticks([1, 3, 7, 14])
     for ax in axes[:, 0]:
-        ax.set_ylabel("Test AUPRC")
+        ax.set_ylabel("Test average precision")
     for ax in axes[-1]:
         ax.set_xlabel("Lead (days)")
-    axes[0, 0].legend(fontsize=7)
+    axes[0, 0].legend(fontsize=9)
     fig.tight_layout()
     visualisation.save(fig, "fig_early_warning", FIG)
     plt.close(fig)

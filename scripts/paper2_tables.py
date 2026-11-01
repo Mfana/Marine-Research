@@ -17,16 +17,13 @@ ZL = {z: z.replace("_", " ").title() for z in ZONES}
 
 def summary_table():
     s = pd.read_csv(TAB / "zone_summary.csv", index_col=0).loc[ZONES]
-    t = pd.read_csv(TAB / "annual_trends.csv")
-    lines = [r"\begin{tabular}{lrrrrrrr}", r"\toprule",
-             r"Zone & Events & Events/yr & MHW days/yr & Mean dur.\ (d) & Max dur.\ (d) & Mean $i_\mathrm{max}$ (\si{\celsius}) & Trend MHW days \\",
-             r" & & & & & & & (d\,yr$^{-1}$\,decade$^{-1}$) \\", r"\midrule"]
+    lines = [r"\begin{tabular}{lrrrrr}", r"\toprule",
+             r"Zone & Events & Days/yr & Mean dur. & Max dur. & Mean peak \\",
+             r" & & & (d) & (d) & (\si{\celsius}) \\", r"\midrule"]
     for z in ZONES:
         r = s.loc[z]
-        tr = t[(t.zone == z) & (t.metric == "mhw_days")].iloc[0]
-        lines.append(f"{ZL[z]} & {int(r.n_events)} & {r.events_per_year:.2f} & {r.mhw_days_per_year:.1f} & "
-                     f"{r.duration_mean:.1f} & {int(r.duration_max)} & {r.intensity_max_mean:.2f} & "
-                     f"{tr.trend_per_decade:+.1f} $\\pm$ {tr.ci95:.1f} \\\\")
+        lines.append(f"{ZL[z]} & {int(r.n_events)} & {r.mhw_days_per_year:.1f} & "
+                     f"{r.duration_mean:.1f} & {int(r.duration_max)} & {r.intensity_max_mean:.2f}" + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}"]
     (TAB / "tab_summary.tex").write_text("\n".join(lines) + "\n")
 

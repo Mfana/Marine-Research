@@ -52,7 +52,7 @@ ZONES = ["benguela_nearshore", "benguela_shelf", "benguela_offshore",
 LEADS = (1, 3, 7, 14)
 # An MHW label on day d depends on days up to d+6 (five-day runs joined across two-day gaps).
 EMBARGO = pd.Timedelta(days=7)
-BOOT_DRAWS, BOOT_BLOCKS = 2000, (30, 60)
+BOOT_DRAWS, BOOT_BLOCKS = 2000, (30, 60, 180, 365)
 
 
 # ---- Part A -------------------------------------------------------------------
@@ -195,7 +195,7 @@ def part_b1(labels, anom, excess, seed, log) -> None:
         f = unsup_features(anom[z]).dropna()
         y = labels[z].reindex(f.index)
         idx = f.index
-        tr, te = split(idx, None, TRAIN_END), split(idx, TEST_START, TEST_END)
+        tr, te = split(idx, None, TRAIN_END), split(idx, TEST_START, pd.Timestamp(TEST_END) - EMBARGO)
         va = split(idx, VAL_START, pd.Timestamp(VAL_END) - EMBARGO)
         sc = StandardScaler().fit(f[tr])
         X = sc.transform(f)
@@ -203,18 +203,20 @@ def part_b1(labels, anom, excess, seed, log) -> None:
         iso = IsolationForest(n_estimators=300, contamination="auto", random_state=seed).fit(X[tr])
         scores["isolation_forest"] = -iso.score_samples(X)
         # Warm-only variant: anomalies flagged only when the 7-day mean anomaly is positive.
-        scores["isolation_forest_warm"] = np.where(f["mean7"] > 0, scores["isolation_forest"], scores["isolation_forest"].min())
+        scores["isolation_forest_warm"] = np.where(f["mean7"] > 0, scores["isolation_forest"], -1.0)
+        # Fixed epoch budget avoids a randomly shuffled internal early-stopping split.
         ae = MLPRegressor(hidden_layer_sizes=(16, 3, 16), max_iter=500, random_state=seed,
-                          early_stopping=True).fit(X[tr], X[tr])
+                          early_stopping=False, shuffle=False).fit(X[tr], X[tr])
         rec = ((ae.predict(X) - X) ** 2).mean(1)
         scores["autoencoder"] = rec
-        scores["autoencoder_warm"] = np.where(f["mean7"] > 0, rec, rec.min())
+        scores["autoencoder_warm"] = np.where(f["mean7"] > 0, rec, -1.0)
+        scores["normalized_exceedance"] = (anom[z] / excess[z]).reindex(idx).to_numpy()
         # Rule baseline: 5-day running minimum of the standardised anomaly (no threshold knowledge).
         sd = anom[z][split(anom.index, None, TRAIN_END)].groupby(anom[z].index.dayofyear[split(anom.index, None, TRAIN_END)]).std()
         zsc = (anom[z] / sd.reindex(anom[z].index.dayofyear).to_numpy()).rolling(5, min_periods=5).min()
         scores["zscore_run5"] = zsc.reindex(idx).to_numpy()
         for name, sco in scores.items():
-            sco = np.nan_to_num(sco, nan=np.nanmin(sco))
+            sco = np.nan_to_num(sco, nan=-1.0)
             thr = best_f1_threshold(y[va], sco[va])
             rows.append({"zone": z, "detector": name, **cls_scores(y[te].to_numpy(), sco[te], thr)})
         log.info("B1 %s done", z)
@@ -299,7 +301,7 @@ def part_b2(labels, anom, excess, seed, log) -> None:
     from sklearn.preprocessing import StandardScaler
     from xgboost import XGBClassifier
     import shap
-    rows, shap_rows, prob_frames = [], [], []
+    rows, shap_rows, prob_frames, val_frames, selections, coefficients = [], [], [], [], [], []
     for z, k in itertools.product(ZONES, LEADS):
         X = ew_features(anom, labels, excess, z)
         y = labels[z].shift(-k).rename("y")
@@ -307,7 +309,7 @@ def part_b2(labels, anom, excess, seed, log) -> None:
         X, y = X[ok], y[ok].astype(int)
         tt = X.index + pd.Timedelta(days=k)        # split on the target day
         tr, va = split(tt, None, pd.Timestamp(TRAIN_END) - EMBARGO), split(tt, VAL_START, pd.Timestamp(VAL_END) - EMBARGO)
-        te, trva = split(tt, TEST_START, TEST_END), split(tt, None, pd.Timestamp(VAL_END) - EMBARGO)
+        te = split(tt, TEST_START, pd.Timestamp(TEST_END) - EMBARGO)
         base_rate = y[tr].mean()
         # Persistence: an event is known to be under way at t (≥5 consecutive exceedance days so far).
         probs = {"base_rate": np.full(te.sum(), base_rate),
@@ -317,13 +319,16 @@ def part_b2(labels, anom, excess, seed, log) -> None:
             "random_forest": [RandomForestClassifier(n_estimators=400, max_depth=d, min_samples_leaf=l, n_jobs=-1,
                                                      random_state=seed, class_weight="balanced_subsample")
                               for d in (6, 12, None) for l in (5, 20)],
+            "rf_unweighted": [RandomForestClassifier(n_estimators=400, max_depth=d, min_samples_leaf=l,
+                               n_jobs=-1, random_state=seed, class_weight=None)
+                               for d in (6, 12, None) for l in (5, 20)],
             "xgboost": [XGBClassifier(n_estimators=n, max_depth=d, learning_rate=0.05, subsample=0.8,
                                       colsample_bytree=0.8, n_jobs=1, random_state=seed, eval_metric="logloss")
                         for n in (200, 600) for d in (3, 5)],
         }
-        from sklearn.base import clone
         from sklearn.metrics import average_precision_score
         thr = {}
+        val_probs = {}
         for name, models in cands.items():
             best, best_m = -1, None
             for m in models:
@@ -332,14 +337,27 @@ def part_b2(labels, anom, excess, seed, log) -> None:
                 if ap > best:
                     best, best_m = ap, m
             thr[name] = best_f1_threshold(y[va], best_m.predict_proba(X[va])[:, 1])
-            final = clone(best_m).fit(X[trva], y[trva])
+            # Keep the exact fitted estimator whose validation predictions selected the
+            # threshold. Validation remains available for sigmoid calibration, with no
+            # post-selection refit that could change its probability scale.
+            final = best_m
+            val_probs[name] = final.predict_proba(X[va])[:, 1]
             probs[name] = final.predict_proba(X[te])[:, 1]
+            selections.append({"zone": z, "lead_days": k, "model": name,
+                               "validation_AP": best, "threshold": thr[name],
+                               "parameters": str(final.get_params())})
+            if name == "logistic":
+                for feat, coef in zip(X.columns, final[-1].coef_[0]):
+                    coefficients.append({"zone": z, "lead_days": k, "feature": feat,
+                                         "standardized_coefficient": coef})
             if name == "xgboost" and k in (1, 7):
                 sv = shap.TreeExplainer(final)(X[te])
                 for feat, v in zip(X.columns, np.abs(sv.values).mean(0)):
                     shap_rows.append({"zone": z, "lead": k, "feature": feat, "mean_abs_shap": v})
         thr["persistence"], thr["base_rate"] = 0.5, base_rate
         y_te = y[te].to_numpy()
+        val_frames.append(pd.DataFrame({"zone": z, "lead_days": k, "date": tt[va],
+                                        "y": y[va].to_numpy(), **val_probs}))
         prob_frames.append(pd.DataFrame({"zone": z, "lead_days": k, "date": tt[te], "y": y_te,
                                          **{m: p for m, p in probs.items()}}))
         bs_ref = brier_score_loss(y_te, probs["base_rate"])
@@ -351,9 +369,13 @@ def part_b2(labels, anom, excess, seed, log) -> None:
         log.info("B2 %s lead %d done", z, k)
     pd.DataFrame(rows).round(4).to_csv(TAB / "early_warning_test.csv", index=False)
     pd.DataFrame(shap_rows).round(5).to_csv(TAB / "early_warning_shap.csv", index=False)
+    pd.DataFrame(coefficients).to_csv(TAB / "logistic_coefficients.csv", index=False)
+    pd.DataFrame(selections).to_csv(TAB / "selected_models.csv", index=False)
+    pd.concat(val_frames, ignore_index=True).to_csv(
+        ROOT / "data/processed/paper2_ew_validation_probs.csv", index=False, float_format="%.8f")
     pr = pd.concat(prob_frames, ignore_index=True)
     pr.to_csv(ROOT / "data" / "processed" / "paper2_ew_test_probs.csv", index=False, float_format="%.5f")
-    ew_uncertainty(pr, seed, log)
+    # Extended comparisons, calibration and uncertainty are generated by paper2_revision.py.
 
 
 def main() -> None:

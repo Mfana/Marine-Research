@@ -47,7 +47,7 @@ def study_area_map(out_dir: Path, name: str = "fig_study_area") -> None:
     axes[1].pcolormesh(sat.longitude, sat.latitude, zid, cmap=ListedColormap(list(ZONE_COLORS.values())),
                        vmin=-0.5, vmax=5.5, shading="auto")
     axes[1].axvline(20, color="k", ls="--", lw=0.8)
-    axes[1].set(title="Zones (nearshore ≤ 50 km overlaps shelf)", xlabel="Longitude (°E)")
+    axes[1].set(title="Zones (nearshore overlaps shelf and offshore)", xlabel="Longitude (°E)")
     fig.legend(handles=[Patch(color=c, label=ZONE_LABEL[k]) for k, c in ZONE_COLORS.items()],
                fontsize=11, loc="lower center", bbox_to_anchor=(.5,-.12),ncol=3)
     for ax in axes:
