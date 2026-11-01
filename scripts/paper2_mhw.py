@@ -13,11 +13,14 @@ no test information leaks into features or labels):
      against Hobday MHW days (AUROC, AUPRC, F1 at a validation-chosen threshold);
   B2 early warning — is day t+k an MHW day? (k = 1, 3, 7, 14) with logistic regression, Random
      Forest and XGBoost vs persistence and base-rate baselines; SHAP for XGBoost.
-Splits: train 1993–2015, validation 2016–2019, test 2020–2024 (evaluated once).
+Splits: train 1993–2015, validation 2016–2019, test 2020–2024. Fitting samples whose label
+depends on days after the end of their split (an MHW day needs a five-day run, and runs are
+joined across two-day gaps) are embargoed. Test-period uncertainty: paired circular block
+bootstrap over target days, with the same resampled days in every zone.
 
 Outputs: papers/paper2/{tables,figures}/, data/processed/paper2_*.
 
-Usage:  .venv/bin/python scripts/paper2_mhw.py
+Usage:  .venv/bin/python scripts/paper2_mhw.py [--ml-only]
 """
 
 import itertools
@@ -47,6 +50,9 @@ TRAIN_END, VAL_START, VAL_END, TEST_START, TEST_END = (
 ZONES = ["benguela_nearshore", "benguela_shelf", "benguela_offshore",
          "agulhas_nearshore", "agulhas_shelf", "agulhas_offshore"]
 LEADS = (1, 3, 7, 14)
+# An MHW label on day d depends on days up to d+6 (five-day runs joined across two-day gaps).
+EMBARGO = pd.Timedelta(days=7)
+BOOT_DRAWS, BOOT_BLOCKS = 2000, (30, 60)
 
 
 # ---- Part A -------------------------------------------------------------------
@@ -189,7 +195,8 @@ def part_b1(labels, anom, excess, seed, log) -> None:
         f = unsup_features(anom[z]).dropna()
         y = labels[z].reindex(f.index)
         idx = f.index
-        tr, va, te = split(idx, None, TRAIN_END), split(idx, VAL_START, VAL_END), split(idx, TEST_START, TEST_END)
+        tr, te = split(idx, None, TRAIN_END), split(idx, TEST_START, TEST_END)
+        va = split(idx, VAL_START, pd.Timestamp(VAL_END) - EMBARGO)
         sc = StandardScaler().fit(f[tr])
         X = sc.transform(f)
         scores = {}
@@ -235,6 +242,55 @@ def ew_features(anom: pd.DataFrame, labels: pd.DataFrame, excess: pd.DataFrame, 
     return pd.DataFrame(f, index=a.index)
 
 
+def block_indices(n: int, block: int, draws: int, rng) -> np.ndarray:
+    """Circular moving-block bootstrap indices, shape (draws, n)."""
+    starts = rng.integers(0, n, size=(draws, -(-n // block)))
+    return ((starts[:, :, None] + np.arange(block)) % n).reshape(draws, -1)[:, :n]
+
+
+def ew_uncertainty(pr: pd.DataFrame, seed: int, log) -> None:
+    """Paired block-bootstrap intervals for logistic regression minus each other model."""
+    from sklearn.metrics import average_precision_score
+    rng = np.random.default_rng(seed)
+    others = ["xgboost", "random_forest", "persistence"]
+    rows = []
+    for k in LEADS:
+        d = pr[pr.lead_days == k]
+        dates = np.sort(d.date.unique())
+        assert all(set(d[d.zone == z].date) == set(dates) for z in ZONES), "zones must share test days"
+        g = {z: d[d.zone == z].set_index("date").loc[dates] for z in ZONES}
+
+        def stats(ix):
+            out = {}
+            for z in ZONES:
+                y = g[z]["y"].to_numpy()[ix]
+                if y.sum() == 0:
+                    return None
+                ref = np.mean((y - g[z]["base_rate"].to_numpy()[ix]) ** 2)
+                for m in ["logistic"] + others:
+                    p = g[z][m].to_numpy()[ix]
+                    out[(z, m, "AUPRC")] = average_precision_score(y, p)
+                    out[(z, m, "BSS")] = 1 - np.mean((y - p) ** 2) / ref
+            return out
+
+        point = stats(np.arange(len(dates)))
+        for block in BOOT_BLOCKS:
+            draws = [stats(ix) for ix in block_indices(len(dates), block, BOOT_DRAWS, rng)]
+            draws = [s for s in draws if s is not None]
+            for m in others:
+                for metric in ("AUPRC", "BSS"):
+                    for z in ZONES + ["mean"]:
+                        zs = ZONES if z == "mean" else [z]
+                        diff = lambda s: np.mean([s[(q, "logistic", metric)] - s[(q, m, metric)] for q in zs])
+                        b = np.array([diff(s) for s in draws])
+                        rows.append({"lead_days": k, "block_days": block, "comparison": f"logistic-{m}",
+                                     "metric": metric, "zone": z, "diff": diff(point),
+                                     "lo": np.quantile(b, 0.025), "hi": np.quantile(b, 0.975),
+                                     "n_draws": len(b)})
+        log.info("Bootstrap lead %d done", k)
+    pd.DataFrame(rows).round(4).to_csv(TAB / "early_warning_uncertainty.csv", index=False)
+
+
 def part_b2(labels, anom, excess, seed, log) -> None:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.linear_model import LogisticRegression
@@ -243,15 +299,15 @@ def part_b2(labels, anom, excess, seed, log) -> None:
     from sklearn.preprocessing import StandardScaler
     from xgboost import XGBClassifier
     import shap
-    rows, shap_rows = [], []
+    rows, shap_rows, prob_frames = [], [], []
     for z, k in itertools.product(ZONES, LEADS):
         X = ew_features(anom, labels, excess, z)
         y = labels[z].shift(-k).rename("y")
         ok = X.notna().all(1) & y.notna()
         X, y = X[ok], y[ok].astype(int)
         tt = X.index + pd.Timedelta(days=k)        # split on the target day
-        tr, va, te = split(tt, None, TRAIN_END), split(tt, VAL_START, VAL_END), split(tt, TEST_START, TEST_END)
-        trva = split(tt, None, VAL_END)
+        tr, va = split(tt, None, pd.Timestamp(TRAIN_END) - EMBARGO), split(tt, VAL_START, pd.Timestamp(VAL_END) - EMBARGO)
+        te, trva = split(tt, TEST_START, TEST_END), split(tt, None, pd.Timestamp(VAL_END) - EMBARGO)
         base_rate = y[tr].mean()
         # Persistence: an event is known to be under way at t (≥5 consecutive exceedance days so far).
         probs = {"base_rate": np.full(te.sum(), base_rate),
@@ -284,6 +340,8 @@ def part_b2(labels, anom, excess, seed, log) -> None:
                     shap_rows.append({"zone": z, "lead": k, "feature": feat, "mean_abs_shap": v})
         thr["persistence"], thr["base_rate"] = 0.5, base_rate
         y_te = y[te].to_numpy()
+        prob_frames.append(pd.DataFrame({"zone": z, "lead_days": k, "date": tt[te], "y": y_te,
+                                         **{m: p for m, p in probs.items()}}))
         bs_ref = brier_score_loss(y_te, probs["base_rate"])
         for name, p in probs.items():
             r = {"zone": z, "lead_days": k, "model": name, **cls_scores(y_te, p, thr[name])}
@@ -293,6 +351,9 @@ def part_b2(labels, anom, excess, seed, log) -> None:
         log.info("B2 %s lead %d done", z, k)
     pd.DataFrame(rows).round(4).to_csv(TAB / "early_warning_test.csv", index=False)
     pd.DataFrame(shap_rows).round(5).to_csv(TAB / "early_warning_shap.csv", index=False)
+    pr = pd.concat(prob_frames, ignore_index=True)
+    pr.to_csv(ROOT / "data" / "processed" / "paper2_ew_test_probs.csv", index=False, float_format="%.5f")
+    ew_uncertainty(pr, seed, log)
 
 
 def main() -> None:
@@ -305,13 +366,15 @@ def main() -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     t0 = time.time()
     daily_z = pd.read_csv(CACHE / "sst_satellite_daily_zones_1993_2024.csv", index_col=0, parse_dates=True)[ZONES]
-    part_a(daily_z, log)
-    part_a_grid(log)
+    if "--ml-only" not in sys.argv:
+        part_a(daily_z, log)
+        part_a_grid(log)
     labels, anom, excess = train_labels_features(daily_z)
     part_b1(labels, anom, excess, seed, log)
     part_b2(labels, anom, excess, seed, log)
     meta = {"seconds": round(time.time() - t0), "baseline_descriptive": BASELINE,
             "ml_climatology": f"1993-01-01..{TRAIN_END}", "leads_days": LEADS,
+            "label_embargo_days": EMBARGO.days, "bootstrap": {"draws": BOOT_DRAWS, "block_days": BOOT_BLOCKS},
             "splits": {"train": f"..{TRAIN_END}", "validation": f"{VAL_START}..{VAL_END}",
                        "test": f"{TEST_START}..{TEST_END}"}}
     (TAB / "run_meta.json").write_text(json.dumps(meta, indent=2))
